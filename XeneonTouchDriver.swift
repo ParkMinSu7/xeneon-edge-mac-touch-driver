@@ -1,5 +1,5 @@
 // XeneonTouchDriver.swift
-전// Corsair Xeneon Edge – macOS 터치 드라이버
+// Corsair Xeneon Edge – macOS 터치 드라이버
 //
 // ── HID 구조 (분석 결과) ─────────────────────────────────────────────────────
 //   VID=0x27c0  PID=0x0859  Interface: Page=0x01 Usage=0x02 (Mouse)
@@ -85,8 +85,8 @@ final class DisplayManager {
         let cgMinY = totalH - f.maxY
 
         switch Int(rotation) {
-        case 90:  return CGPoint(x: f.minX + ny * f.width,         y: cgMinY + (1 - nx) * f.height)
-        case 270: return CGPoint(x: f.minX + (1 - ny) * f.width,   y: cgMinY + nx * f.height)
+        case 90:  return CGPoint(x: f.minX + (1 - ny) * f.width,   y: cgMinY + nx * f.height)
+        case 270: return CGPoint(x: f.minX + ny * f.width,         y: cgMinY + (1 - nx) * f.height)
         case 180: return CGPoint(x: f.minX + (1 - nx) * f.width,   y: cgMinY + (1 - ny) * f.height)
         default:  return CGPoint(x: f.minX + nx * f.width,         y: cgMinY + ny * f.height)
         }
