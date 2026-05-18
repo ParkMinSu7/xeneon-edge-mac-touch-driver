@@ -96,178 +96,159 @@ final class DisplayManager {
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - 제스처 엔진
 // ─────────────────────────────────────────────────────────────────────────────
+//
+// 1손가락:
+//   다운 즉시 커서 이동
+//   이동하면 → 스크롤 (위아래: 수직스크롤, 좌우: 수평스크롤)
+//   0.4초 이상 누르고 있으면 → 드래그 모드 (mouseDown 유지, 이후 이동 시 drag)
+//   이동 없이 올리면 → 클릭 / 더블클릭
+//
+// 2손가락:
+//   이동 → 스크롤 + 모멘텀
+//   탭 (이동 없이) → 우클릭
+//
+// 3손가락:
+//   위 → Mission Control
+//   아래 → App Exposé
+//   좌우 → Spaces 전환
 
 final class GestureEngine {
     private let display: DisplayManager
 
-    // ── 상태 ────────────────────────────────────────────────────────────────
-    private var activeButtons = 0        // 현재 눌린 버튼 수
+    // ── 1손가락 ──────────────────────────────────────────────────────────────
+    private enum OneMode { case idle, hold, scrolling, dragging }
+    private var oneMode      = OneMode.idle
+    private var oneDown      = false
+    private var oneStartPt   = CGPoint.zero
+    private var oneStartTime = Date()
+    private var onePrevPt    = CGPoint.zero
+    private var onePrevTime  = Date()
+    private var oneVelX: CGFloat = 0
+    private var oneVelY: CGFloat = 0
+    private var oneScrollBegan   = false
+    private var holdTimer: Timer?   // 0.4초 후 드래그 모드 진입
 
-    // 1손가락
-    private var one_startPt    = CGPoint.zero
-    private var one_startTime  = Date()
-    private var one_prevPt     = CGPoint.zero
-    private var one_prevTime   = Date()
-    private var one_velX: CGFloat = 0
-    private var one_velY: CGFloat = 0
-    private var one_dragging   = false   // 드래그 중 (mouseDown 보낸 상태)
-    private var one_scrolling  = false   // 스크롤 중
-    private var one_scrollBegan = false
+    // ── 탭/더블탭 ────────────────────────────────────────────────────────────
+    private var lastTapTime: Date    = .distantPast
+    private var lastTapPt:   CGPoint = .zero
 
-    // 드래그 모드 감지: 탭 직후 재터치
-    private var lastTapTime:   Date    = .distantPast
-    private var lastTapPt:     CGPoint = .zero
-    private var dragModeArmed  = false   // 탭 후 드래그 대기 중
+    // ── 2손가락 ──────────────────────────────────────────────────────────────
+    private var twoStartPt    = CGPoint.zero
+    private var twoStartTime  = Date()
+    private var twoPrevPt     = CGPoint.zero
+    private var twoVelX: CGFloat = 0
+    private var twoVelY: CGFloat = 0
+    private var twoScrollBegan = false
 
-    // 2손가락
-    private var two_startPt   = CGPoint.zero
-    private var two_startTime = Date()
-    private var two_prevPt    = CGPoint.zero
-    private var two_velX: CGFloat = 0
-    private var two_velY: CGFloat = 0
-    private var two_scrolling = false
-    private var two_scrollBegan = false
+    // ── 3손가락 ──────────────────────────────────────────────────────────────
+    private var threeStartPt = CGPoint.zero
 
-    // 3손가락
-    private var three_startPt   = CGPoint.zero
-    private var three_startTime = Date()
-
-    // 모멘텀
+    // ── 모멘텀 ───────────────────────────────────────────────────────────────
     private var momentumTimer: Timer?
-    private var dragArmTimer:  Timer?   // 드래그 모드 만료 타이머
 
     init(display: DisplayManager) { self.display = display }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // MARK: 메인 진입점 - HID에서 버튼/좌표 변화 시 호출
+    // MARK: 버튼 이벤트
     // ─────────────────────────────────────────────────────────────────────────
 
     func onButtonDown(count: Int, at pt: CGPoint) {
-        NSLog("[Xeneon] 버튼 다운 \(count)개 (\(Int(pt.x)),\(Int(pt.y)))")
         stopMomentum()
-
         switch count {
         case 1:
-            one_startPt    = pt
-            one_startTime  = Date()
-            one_prevPt     = pt
-            one_prevTime   = Date()
-            one_velX       = 0; one_velY = 0
-            one_scrolling  = false
-            one_scrollBegan = false
-
-            // 탭 직후(0.35초 내) 재터치 → 드래그 모드
-            let tapElapsed = Date().timeIntervalSince(lastTapTime)
-            let tapDist    = hypot(pt.x - lastTapPt.x, pt.y - lastTapPt.y)
-            if dragModeArmed && tapElapsed < kDoubleTapSec && tapDist < 40 {
-                // 드래그 시작: mouseDown 전송
-                one_dragging = true
-                dragModeArmed = false
-                dragArmTimer?.invalidate()
-                moveCursor(to: pt)
-                postMouse(.leftMouseDown, at: pt)
-                NSLog("[Xeneon] 드래그 시작 (탭+드래그)")
-            } else {
-                one_dragging = false
-                moveCursor(to: pt)
+            oneDown      = true
+            oneMode      = .hold          // 기본: 홀드 상태
+            oneStartPt   = pt
+            oneStartTime = Date()
+            onePrevPt    = pt
+            onePrevTime  = Date()
+            oneVelX      = 0; oneVelY = 0
+            oneScrollBegan = false
+            moveCursor(to: pt)
+            // 0.4초 후 드래그 모드 진입
+            holdTimer?.invalidate()
+            holdTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in
+                guard let self = self, self.oneMode == .hold else { return }
+                self.oneMode = .dragging
+                self.postMouse(.leftMouseDown, at: self.onePrevPt)
+                NSLog("[Xeneon] 드래그 모드 진입")
             }
-
         case 2:
-            two_startPt   = pt
-            two_startTime = Date()
-            two_prevPt    = pt
-            two_velX      = 0; two_velY = 0
-            two_scrolling = false
-            two_scrollBegan = false
-
+            twoStartPt   = pt
+            twoStartTime = Date()
+            twoPrevPt    = pt
+            twoVelX      = 0; twoVelY = 0
+            twoScrollBegan = false
         case 3:
-            three_startPt   = pt
-            three_startTime = Date()
-
+            threeStartPt = pt
         default: break
         }
-
-        activeButtons = count
     }
 
     func onButtonUp(count: Int, at pt: CGPoint) {
-        NSLog("[Xeneon] 버튼 업 \(count)개 (\(Int(pt.x)),\(Int(pt.y)))")
-
         switch count {
         case 1: finishOne(at: pt)
         case 2: finishTwo(at: pt)
         case 3: finishThree(at: pt)
         default: break
         }
-
-        activeButtons = 0
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // MARK: 이동
+    // ─────────────────────────────────────────────────────────────────────────
+
     func onMove(at pt: CGPoint) {
-        guard activeButtons > 0 else { return }
-
+        guard oneDown else { return }
         let now = Date()
-        let dt  = max(now.timeIntervalSince(one_prevTime), 0.001)
+        let dt  = max(now.timeIntervalSince(onePrevTime), 0.001)
+        let dx  = pt.x - onePrevPt.x
+        let dy  = pt.y - onePrevPt.y
+        oneVelX = dx / CGFloat(dt)
+        oneVelY = dy / CGFloat(dt)
 
-        switch activeButtons {
-        case 1:
-            let dx = pt.x - one_prevPt.x
-            let dy = pt.y - one_prevPt.y
-            one_velX = dx / CGFloat(dt)
-            one_velY = dy / CGFloat(dt)
-
-            let disp = hypot(pt.x - one_startPt.x, pt.y - one_startPt.y)
-
-            if !one_scrolling && !one_dragging {
-                if disp > kTapMaxMove {
-                    one_scrolling = true
-                    NSLog("[Xeneon] 스크롤 모드")
-                }
-            }
-
-            if one_dragging {
-                moveCursor(to: pt)
-                postMouse(.leftMouseDragged, at: pt)
-            } else if one_scrolling {
-                if !one_scrollBegan {
-                    sendScroll(dx: 0, dy: 0, phase: 1, at: pt)
-                    one_scrollBegan = true
-                }
+        switch oneMode {
+        case .hold:
+            let disp = hypot(pt.x - oneStartPt.x, pt.y - oneStartPt.y)
+            if disp > 8 {
+                // 이동 감지 → 스크롤 모드로 전환 (홀드 타이머 취소)
+                holdTimer?.invalidate(); holdTimer = nil
+                oneMode = .scrolling
+                sendScroll(dx: 0, dy: 0, phase: 1, at: pt)
+                oneScrollBegan = true
                 sendScroll(dx: dx * kScrollScale, dy: dy * kScrollScale, phase: 2, at: pt)
             } else {
                 moveCursor(to: pt)
             }
 
-            one_prevPt   = pt
-            one_prevTime = now
+        case .scrolling:
+            sendScroll(dx: dx * kScrollScale, dy: dy * kScrollScale, phase: 2, at: pt)
 
-        case 2:
-            let dx = pt.x - two_prevPt.x
-            let dy = pt.y - two_prevPt.y
-            let dt2 = max(now.timeIntervalSince(two_prevPt == two_startPt ? two_startTime : one_prevTime), 0.001)
-            two_velX = dx / CGFloat(dt2)
-            two_velY = dy / CGFloat(dt2)
+        case .dragging:
+            moveCursor(to: pt)
+            postMouse(.leftMouseDragged, at: pt)
 
-            let disp = hypot(pt.x - two_startPt.x, pt.y - two_startPt.y)
-            if !two_scrolling && disp > kTapMaxMove {
-                two_scrolling = true
-            }
-
-            if two_scrolling {
-                if !two_scrollBegan {
-                    sendScroll(dx: 0, dy: 0, phase: 1, at: pt)
-                    two_scrollBegan = true
-                }
-                sendScroll(dx: dx * kScrollScale, dy: dy * kScrollScale, phase: 2, at: pt)
-            }
-
-            two_prevPt = pt
-
-        case 3:
-            break // 3손가락은 up 시 처리
-
-        default: break
+        case .idle: break
         }
+
+        onePrevPt   = pt
+        onePrevTime = now
+    }
+
+    func onTwoMove(at pt: CGPoint) {
+        let dx = pt.x - twoPrevPt.x
+        let dy = pt.y - twoPrevPt.y
+        twoVelX = dx; twoVelY = dy
+
+        let disp = hypot(pt.x - twoStartPt.x, pt.y - twoStartPt.y)
+        if !twoScrollBegan && disp > 8 {
+            sendScroll(dx: 0, dy: 0, phase: 1, at: pt)
+            twoScrollBegan = true
+        }
+        if twoScrollBegan {
+            sendScroll(dx: dx * kScrollScale, dy: dy * kScrollScale, phase: 2, at: pt)
+        }
+        twoPrevPt = pt
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -275,47 +256,37 @@ final class GestureEngine {
     // ─────────────────────────────────────────────────────────────────────────
 
     private func finishOne(at pt: CGPoint) {
-        let disp  = hypot(pt.x - one_startPt.x, pt.y - one_startPt.y)
-        let dur   = Date().timeIntervalSince(one_startTime)
-        let speed = hypot(one_velX, one_velY)
-        NSLog("[Xeneon] 1손가락 종료 disp=\(Int(disp)) dur=\(String(format:"%.2f",dur))s speed=\(Int(speed))")
+        holdTimer?.invalidate(); holdTimer = nil
+        oneDown = false
 
-        if one_dragging {
-            postMouse(.leftMouseUp, at: pt)
-            one_dragging = false
+        let disp = hypot(pt.x - oneStartPt.x, pt.y - oneStartPt.y)
+        let dur  = Date().timeIntervalSince(oneStartTime)
+        let spd  = hypot(oneVelX, oneVelY)
+        NSLog("[Xeneon] 1업 mode=\(oneMode) disp=\(Int(disp)) dur=\(String(format:"%.2f",dur))s spd=\(Int(spd))")
 
-        } else if one_scrolling {
-            if one_scrollBegan {
-                sendScroll(dx: 0, dy: 0, phase: 4, at: pt)
-            }
-            // 수평 플릭 → 뒤로/앞으로
-            let ax = abs(pt.x - one_startPt.x)
-            let ay = abs(pt.y - one_startPt.y)
-            if speed > kFlickSpeed && disp > kFlickDist && ax > ay * 1.5 {
-                let src = CGEventSource(stateID: .hidSystemState)
-                if pt.x < one_startPt.x {
-                    sendKey(33, flags: .maskCommand, src: src)
-                    NSLog("[Xeneon] 플릭 왼쪽 → 뒤로")
-                } else {
-                    sendKey(30, flags: .maskCommand, src: src)
-                    NSLog("[Xeneon] 플릭 오른쪽 → 앞으로")
-                }
-            } else if speed > 60 {
-                // 수직 모멘텀
-                startMomentum(vx: one_velX * kScrollScale * 0.15,
-                              vy: one_velY * kScrollScale * 0.15, at: pt)
-            }
-
-        } else {
-            // 탭: 이동 없이 뗌
+        switch oneMode {
+        case .hold:
+            // 이동 없이 올림 → 탭
             if disp < kTapMaxMove && dur < kTapMaxDur {
                 handleTap(at: pt)
             }
+
+        case .scrolling:
+            sendScroll(dx: 0, dy: 0, phase: 4, at: pt)
+            // 모멘텀
+            if spd > 60 {
+                startMomentum(vx: oneVelX * kScrollScale * 0.15,
+                              vy: oneVelY * kScrollScale * 0.15, at: pt)
+            }
+
+        case .dragging:
+            postMouse(.leftMouseUp, at: pt)
+            NSLog("[Xeneon] 드래그 종료")
+
+        case .idle: break
         }
 
-        one_scrolling  = false
-        one_scrollBegan = false
-        one_dragging   = false
+        oneMode = .idle
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -323,40 +294,22 @@ final class GestureEngine {
     // ─────────────────────────────────────────────────────────────────────────
 
     private func finishTwo(at pt: CGPoint) {
-        let disp  = hypot(pt.x - two_startPt.x, pt.y - two_startPt.y)
-        let dur   = Date().timeIntervalSince(two_startTime)
-        let speed = hypot(two_velX, two_velY)
-        NSLog("[Xeneon] 2손가락 종료 disp=\(Int(disp)) dur=\(String(format:"%.2f",dur))s speed=\(Int(speed))")
+        let disp = hypot(pt.x - twoStartPt.x, pt.y - twoStartPt.y)
+        let dur  = Date().timeIntervalSince(twoStartTime)
+        let spd  = hypot(twoVelX, twoVelY)
+        NSLog("[Xeneon] 2업 disp=\(Int(disp)) dur=\(String(format:"%.2f",dur))s")
 
-        if two_scrolling {
-            if two_scrollBegan {
-                sendScroll(dx: 0, dy: 0, phase: 4, at: pt)
-            }
-            // 모멘텀
-            if speed > 60 {
-                startMomentum(vx: two_velX * kScrollScale * 0.15,
-                              vy: two_velY * kScrollScale * 0.15, at: pt)
-            }
-            // 수평 플릭
-            let ax = abs(pt.x - two_startPt.x)
-            let ay = abs(pt.y - two_startPt.y)
-            if speed > kFlickSpeed && disp > kFlickDist && ax > ay * 1.5 {
-                let src = CGEventSource(stateID: .hidSystemState)
-                if pt.x < two_startPt.x {
-                    sendKey(33, flags: .maskCommand, src: src)
-                    NSLog("[Xeneon] 2손가락 플릭 왼쪽 → 뒤로")
-                } else {
-                    sendKey(30, flags: .maskCommand, src: src)
-                    NSLog("[Xeneon] 2손가락 플릭 오른쪽 → 앞으로")
-                }
+        if twoScrollBegan {
+            sendScroll(dx: 0, dy: 0, phase: 4, at: pt)
+            if spd > 60 {
+                startMomentum(vx: twoVelX * kScrollScale * 0.15,
+                              vy: twoVelY * kScrollScale * 0.15, at: pt)
             }
         } else if disp < kTapMaxMove && dur < 0.4 {
-            // 2손가락 탭 → 우클릭
             doRightClick(at: pt)
         }
 
-        two_scrolling = false
-        two_scrollBegan = false
+        twoScrollBegan = false
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -364,30 +317,18 @@ final class GestureEngine {
     // ─────────────────────────────────────────────────────────────────────────
 
     private func finishThree(at pt: CGPoint) {
-        let dx   = pt.x - three_startPt.x
-        let dy   = pt.y - three_startPt.y
+        let dx   = pt.x - threeStartPt.x
+        let dy   = pt.y - threeStartPt.y
         let dist = hypot(dx, dy)
-        NSLog("[Xeneon] 3손가락 종료 dist=\(Int(dist))")
-
+        NSLog("[Xeneon] 3업 dist=\(Int(dist))")
         guard dist >= kSwipeDist else { return }
-
         let src = CGEventSource(stateID: .hidSystemState)
         if abs(dy) >= abs(dx) {
-            if dy < 0 {
-                sendKey(126, flags: .maskControl, src: src)  // Ctrl+↑ Mission Control
-                NSLog("[Xeneon] 3손가락 위 → Mission Control")
-            } else {
-                sendKey(125, flags: .maskControl, src: src)  // Ctrl+↓ App Exposé
-                NSLog("[Xeneon] 3손가락 아래 → App Exposé")
-            }
+            sendKey(dy < 0 ? 126 : 125, flags: .maskControl, src: src)
+            NSLog("[Xeneon] 3손가락 \(dy<0 ? "위→MC":"아래→Exposé")")
         } else {
-            if dx < 0 {
-                sendKey(124, flags: .maskControl, src: src)  // Ctrl+→ 다음 Space
-                NSLog("[Xeneon] 3손가락 오른쪽 → 다음 Space")
-            } else {
-                sendKey(123, flags: .maskControl, src: src)  // Ctrl+← 이전 Space
-                NSLog("[Xeneon] 3손가락 왼쪽 → 이전 Space")
-            }
+            sendKey(dx < 0 ? 124 : 123, flags: .maskControl, src: src)
+            NSLog("[Xeneon] 3손가락 \(dx<0 ? "오른쪽 Space":"왼쪽 Space")")
         }
     }
 
@@ -400,19 +341,10 @@ final class GestureEngine {
         let tdist   = hypot(pt.x - lastTapPt.x, pt.y - lastTapPt.y)
         if elapsed < kDoubleTapSec && tdist < 40 {
             doDoubleClick(at: pt)
-            lastTapTime   = .distantPast
-            dragModeArmed = false
-            dragArmTimer?.invalidate()
+            lastTapTime = .distantPast
         } else {
             doClick(at: pt)
-            lastTapTime   = Date()
-            lastTapPt     = pt
-            // 탭 후 드래그 대기: 0.35초 내 재터치 시 드래그 모드
-            dragModeArmed = true
-            dragArmTimer?.invalidate()
-            dragArmTimer = Timer.scheduledTimer(withTimeInterval: kDoubleTapSec, repeats: false) { [weak self] _ in
-                self?.dragModeArmed = false
-            }
+            lastTapTime = Date(); lastTapPt = pt
         }
     }
 
@@ -420,9 +352,7 @@ final class GestureEngine {
     // MARK: 이벤트 전송
     // ─────────────────────────────────────────────────────────────────────────
 
-    private func moveCursor(to pt: CGPoint) {
-        CGDisplayMoveCursorToPoint(CGMainDisplayID(), pt)
-    }
+    private func moveCursor(to pt: CGPoint) { CGDisplayMoveCursorToPoint(CGMainDisplayID(), pt) }
 
     private func postMouse(_ type: CGEventType, at pt: CGPoint) {
         let btn: CGMouseButton = (type == .rightMouseDown || type == .rightMouseUp) ? .right : .left
@@ -634,9 +564,12 @@ final class HIDLayer {
         moveTimer = Timer.scheduledTimer(withTimeInterval: 0.008, repeats: false) { [weak self] _ in
             guard let self = self, self.bufXYDirty else { return }
             self.bufXYDirty = false
-            guard self.prevCount > 0 else { return }
             let pt = self.display.toScreen(nx: self.bufX / kRawMaxX, ny: self.bufY / kRawMaxY)
-            self.engine.onMove(at: pt)
+            switch self.prevCount {
+            case 1: self.engine.onMove(at: pt)
+            case 2: self.engine.onTwoMove(at: pt)
+            default: break
+            }
         }
     }
 
