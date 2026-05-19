@@ -44,7 +44,8 @@ let kDoubleTapSec:  TimeInterval = 0.32   // 더블탭 간격
 let kRightClickSec: TimeInterval = 1.00   // 우클릭 롱프레스 시간
 let kScrollScale:   CGFloat      = 3.5    // 스크롤 배율
 let kMomentumDecay: CGFloat      = 0.82   // 모멘텀 감속
-let kMoveThresh:    CGFloat      = 8.0    // 스크롤 진입 임계값
+let kMoveThresh:    CGFloat      = 3.0    // 스크롤 진입 임계값 (낮을수록 즉각 반응)
+let kAxisRatio:     CGFloat      = 2.0    // 방향 결정 비율 (한 축이 다른 축의 2배 이상이면 잠금)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - 디스플레이 관리 (피벗 포함)
@@ -101,22 +102,27 @@ final class GestureEngine {
     private let display: DisplayManager
 
     // holding  : 접촉 시작, 대기
-    // dragReady: 0.38s 경과 → mouseDown 유지, 이동하면 drag
-    // dragging : dragReady 상태에서 이동 중
-    // scrolling: 빠른 이동 감지 → 스크롤
+    // dragReady: 0.38s 정지 유지 → mouseDown 전송, 이동 시 drag
+    // dragging : dragReady 후 이동 중 (실제 드래그)
+    // scrolling: 이동 감지 → 스크롤 (상하/좌우 축 잠금)
     // idle     : 우클릭 완료 후 손 뗄 때까지 대기
     private enum State { case idle, holding, dragReady, dragging, scrolling }
-    private var state       = State.idle
-    private var isDown      = false
-    private var startPt     = CGPoint.zero
-    private var startAt     = Date()
-    private var prevPt      = CGPoint.zero
-    private var prevAt      = Date()
+
+    // 스크롤 방향 축 잠금
+    private enum ScrollAxis { case undecided, vertical, horizontal }
+
+    private var state      = State.idle
+    private var scrollAxis = ScrollAxis.undecided
+    private var isDown     = false
+    private var startPt    = CGPoint.zero
+    private var startAt    = Date()
+    private var prevPt     = CGPoint.zero
+    private var prevAt     = Date()
     private var velX: CGFloat = 0
     private var velY: CGFloat = 0
 
-    private var lastTapAt:  Date    = .distantPast
-    private var lastTapPt:  CGPoint = .zero
+    private var lastTapAt: Date    = .distantPast
+    private var lastTapPt: CGPoint = .zero
 
     private var dragReadyTimer:  Timer?
     private var rightClickTimer: Timer?
@@ -128,14 +134,15 @@ final class GestureEngine {
 
     func onDown(at pt: CGPoint) {
         stopMomentum()
-        isDown  = true
-        state   = .holding
+        isDown     = true
+        state      = .holding
+        scrollAxis = .undecided
         startPt = pt; startAt = Date()
         prevPt  = pt; prevAt  = Date()
         velX = 0; velY = 0
         moveCursor(to: pt)
 
-        // 0.38초: dragReady 진입 (mouseDown 유지)
+        // 0.38초 정지 → dragReady (mouseDown 유지)
         dragReadyTimer?.invalidate()
         dragReadyTimer = Timer.scheduledTimer(withTimeInterval: 0.38, repeats: false) { [weak self] _ in
             guard let self = self, self.state == .holding else { return }
@@ -144,22 +151,18 @@ final class GestureEngine {
             NSLog("[Xeneon] 드래그 준비")
         }
 
-        // 1.0초: 우클릭 (이동이 없었을 때만)
+        // 1.0초 정지 → 우클릭
         rightClickTimer?.invalidate()
         rightClickTimer = Timer.scheduledTimer(withTimeInterval: kRightClickSec,
                                                repeats: false) { [weak self] _ in
             guard let self = self else { return }
             switch self.state {
             case .holding:
-                self.doRightClick(at: pt)
-                self.state = .idle
+                self.doRightClick(at: pt); self.state = .idle
             case .dragReady:
-                // mouseDown 상태이므로 mouseUp 먼저
                 self.postMouse(.leftMouseUp, at: pt)
-                self.doRightClick(at: pt)
-                self.state = .idle
-            default:
-                break
+                self.doRightClick(at: pt);  self.state = .idle
+            default: break
             }
         }
     }
@@ -172,32 +175,59 @@ final class GestureEngine {
         let dt  = max(now.timeIntervalSince(prevAt), 0.001)
         let dx  = pt.x - prevPt.x
         let dy  = pt.y - prevPt.y
-        velX = dx / CGFloat(dt)
-        velY = dy / CGFloat(dt)
+        // 속도 지수 평활 (급격한 노이즈 완화)
+        velX = velX * 0.5 + (dx / CGFloat(dt)) * 0.5
+        velY = velY * 0.5 + (dy / CGFloat(dt)) * 0.5
 
         switch state {
         case .holding:
-            if hypot(pt.x - startPt.x, pt.y - startPt.y) > kMoveThresh {
-                dragReadyTimer?.invalidate();  dragReadyTimer = nil
+            let totalDx = abs(pt.x - startPt.x)
+            let totalDy = abs(pt.y - startPt.y)
+            let disp    = hypot(totalDx, totalDy)
+
+            // 조금이라도 움직이면 dragReady 타이머 즉시 취소 → 스크롤 우선
+            if disp > 0.5 {
+                dragReadyTimer?.invalidate(); dragReadyTimer = nil
+            }
+
+            if disp > kMoveThresh {
                 rightClickTimer?.invalidate(); rightClickTimer = nil
+
+                // 출발 방향으로 축 결정
+                if      totalDx > totalDy * kAxisRatio { scrollAxis = .horizontal }
+                else if totalDy > totalDx * kAxisRatio { scrollAxis = .vertical   }
+                else                                    { scrollAxis = .undecided  }
+
                 state = .scrolling
                 sendScroll(dx: 0, dy: 0, phase: 1, at: pt)
-                sendScroll(dx: dx * kScrollScale, dy: dy * kScrollScale, phase: 2, at: pt)
+                let (sdx, sdy) = axisLocked(dx: dx, dy: dy)
+                sendScroll(dx: sdx * kScrollScale, dy: sdy * kScrollScale, phase: 2, at: pt)
             } else {
                 moveCursor(to: pt)
             }
+
         case .dragReady:
-            // 이동 감지 → 드래그 모드 (우클릭 타이머 취소)
             rightClickTimer?.invalidate(); rightClickTimer = nil
             state = .dragging
             moveCursor(to: pt)
             postMouse(.leftMouseDragged, at: pt)
             NSLog("[Xeneon] 드래그 시작")
+
         case .dragging:
             moveCursor(to: pt)
             postMouse(.leftMouseDragged, at: pt)
+
         case .scrolling:
-            sendScroll(dx: dx * kScrollScale, dy: dy * kScrollScale, phase: 2, at: pt)
+            // 방향 미결정 상태라면 계속 판별
+            if scrollAxis == .undecided {
+                let totalDx = abs(pt.x - startPt.x)
+                let totalDy = abs(pt.y - startPt.y)
+                if      totalDx > totalDy * kAxisRatio { scrollAxis = .horizontal }
+                else if totalDy > totalDx * kAxisRatio { scrollAxis = .vertical   }
+            }
+            let (sdx, sdy) = axisLocked(dx: dx, dy: dy)
+            sendScroll(dx: sdx * kScrollScale, dy: sdy * kScrollScale, phase: 2, at: pt)
+
         case .idle:
             break
         }
@@ -226,13 +256,25 @@ final class GestureEngine {
         case .scrolling:
             sendScroll(dx: 0, dy: 0, phase: 4, at: pt)
             if spd > 60 {
-                startMomentum(vx: velX * kScrollScale * 0.13,
-                              vy: velY * kScrollScale * 0.13, at: pt)
+                let (mvx, mvy) = axisLocked(dx: velX * kScrollScale * 0.13,
+                                            dy: velY * kScrollScale * 0.13)
+                startMomentum(vx: mvx, vy: mvy, at: pt)
             }
         case .idle:
             break
         }
         state = .idle
+        scrollAxis = .undecided
+    }
+
+    // ── 방향 축 잠금 ─────────────────────────────────────────────────────────
+
+    private func axisLocked(dx: CGFloat, dy: CGFloat) -> (CGFloat, CGFloat) {
+        switch scrollAxis {
+        case .horizontal: return (dx, 0)
+        case .vertical:   return (0, dy)
+        case .undecided:  return (dx, dy)
+        }
     }
 
     // ── 탭 / 더블탭 ──────────────────────────────────────────────────────────
@@ -293,7 +335,7 @@ final class GestureEngine {
     private func sendScroll(dx: CGFloat, dy: CGFloat, phase: Int64, at pt: CGPoint) {
         guard let ev = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
                                wheelCount: 2,
-                               wheel1: Int32(-dy), wheel2: Int32(-dx), wheel3: 0) else { return }
+                               wheel1: Int32(-dy), wheel2: Int32(dx), wheel3: 0) else { return }
         ev.setIntegerValueField(.scrollWheelEventIsContinuous,  value: 1)
         ev.setIntegerValueField(.scrollWheelEventScrollPhase,   value: phase)
         ev.setIntegerValueField(.scrollWheelEventMomentumPhase, value: 0)
@@ -304,7 +346,7 @@ final class GestureEngine {
     private func sendScrollMomentum(dx: CGFloat, dy: CGFloat, phase: Int64, at pt: CGPoint) {
         guard let ev = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
                                wheelCount: 2,
-                               wheel1: Int32(-dy), wheel2: Int32(-dx), wheel3: 0) else { return }
+                               wheel1: Int32(-dy), wheel2: Int32(dx), wheel3: 0) else { return }
         ev.setIntegerValueField(.scrollWheelEventIsContinuous,  value: 1)
         ev.setIntegerValueField(.scrollWheelEventScrollPhase,   value: 0)
         ev.setIntegerValueField(.scrollWheelEventMomentumPhase, value: phase)
@@ -340,9 +382,8 @@ final class HIDLayer {
 
     private var bufX: CGFloat = 0
     private var bufY: CGFloat = 0
-    private var xyDirty = false
-    private var isDown  = false
-    private var moveTimer: Timer?
+    private var isDown      = false
+    private var movePending = false   // CFRunLoop 블록이 이미 큐에 있는지 여부
 
     init(engine: GestureEngine, display: DisplayManager) {
         self.engine = engine; self.display = display
@@ -405,16 +446,16 @@ final class HIDLayer {
         let v  = IOHIDValueGetIntegerValue(value)
 
         switch (pg, us) {
-        case (0x0001, 0x0030):  // X
-            bufX = CGFloat(v); xyDirty = true
+        case (0x0001, 0x0030):  // X 절대 좌표
+            bufX = CGFloat(v)
             scheduleMoveFlush()
 
-        case (0x0001, 0x0031):  // Y
-            bufY = CGFloat(v); xyDirty = true
+        case (0x0001, 0x0031):  // Y 절대 좌표
+            bufY = CGFloat(v)
             scheduleMoveFlush()
 
-        case (0x0009, 0x0001):  // Button1
-            cancelMoveTimer()
+        case (0x0009, 0x0001):  // Button1 (터치 on/off)
+            movePending = false  // 버튼 이벤트 시 대기 중인 이동 플러시 취소
             let wasDown = isDown
             isDown = (v != 0)
             let pt = screenPt()
@@ -432,16 +473,23 @@ final class HIDLayer {
         }
     }
 
+    // X/Y가 같은 HID 보고서에서 거의 동시에 도착한다.
+    // 8ms 타이머를 쓰면 125Hz(=8ms) 보고율에서 타이머가 계속 취소·재시작되어
+    // onMove가 영원히 호출되지 않는 버그 발생 → CFRunLoop 블록으로 교체.
+    // movePending 플래그로 중복 블록 방지, 블록은 현재 런루프 콜백이 모두
+    // 끝난 직후 실행되므로 X/Y 둘 다 업데이트된 상태에서 onMove가 호출된다.
     private func scheduleMoveFlush() {
-        moveTimer?.invalidate()
-        moveTimer = Timer.scheduledTimer(withTimeInterval: 0.008, repeats: false) { [weak self] _ in
-            guard let s = self, s.xyDirty, s.isDown else { return }
-            s.xyDirty = false
+        guard !movePending else { return }
+        movePending = true
+        let rl = CFRunLoopGetMain()
+        CFRunLoopPerformBlock(rl, CFRunLoopMode.defaultMode.rawValue as CFTypeRef) { [weak self] in
+            guard let s = self else { return }
+            s.movePending = false
+            guard s.isDown else { return }
             s.engine.onMove(at: s.screenPt())
         }
+        CFRunLoopWakeUp(rl)
     }
-
-    private func cancelMoveTimer() { moveTimer?.invalidate(); moveTimer = nil }
 
     private func screenPt() -> CGPoint {
         display.toScreen(nx: bufX / kRawMaxX, ny: bufY / kRawMaxY)
