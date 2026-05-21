@@ -46,6 +46,44 @@ let kScrollScale:   CGFloat      = 3.5    // 스크롤 배율
 let kMomentumDecay: CGFloat      = 0.82   // 모멘텀 감속
 let kMoveThresh:    CGFloat      = 3.0    // 스크롤 진입 임계값 (낮을수록 즉각 반응)
 let kAxisRatio:     CGFloat      = 2.0    // 방향 결정 비율 (한 축이 다른 축의 2배 이상이면 잠금)
+let kSwipeMinPx:    CGFloat      = 40.0   // 페이지 스와이프 판정 최소 수평 이동량
+
+let kSwipeSockPath  = "/tmp/xeneon-swipe.sock"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - 스와이프 소켓 알림
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 좌우 스와이프 완료 시 Electron 앱(유닉스 소켓 서버)에 방향 문자열 전송
+/// 소켓이 열려있지 않으면 조용히 무시함
+func sendSwipe(_ direction: String) {
+    let path = kSwipeSockPath
+    let msg  = direction + "\n"
+    DispatchQueue.global(qos: .userInteractive).async {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return }
+        defer { Darwin.close(fd) }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        _ = path.withCString { ptr in
+            withUnsafeMutablePointer(to: &addr.sun_path) {
+                $0.withMemoryRebound(to: CChar.self, capacity: 108) {
+                    strncpy($0, ptr, 107)
+                }
+            }
+        }
+        let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
+        let ok = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(fd, $0, addrLen)
+            }
+        }
+        guard ok == 0 else { return }
+        _ = msg.withCString { Darwin.send(fd, $0, strlen($0), 0) }
+        NSLog("[Xeneon] 스와이프 → \(direction)")
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - 디스플레이 관리 (피벗 포함)
@@ -255,6 +293,23 @@ final class GestureEngine {
             NSLog("[Xeneon] 드래그 종료")
         case .scrolling:
             sendScroll(dx: 0, dy: 0, phase: 4, at: pt)
+
+            // 스와이프 완료 시 방향 신호 전송
+            let totalDx = pt.x - startPt.x
+            let totalDy = pt.y - startPt.y
+            switch scrollAxis {
+            case .horizontal:
+                if abs(totalDx) >= kSwipeMinPx {
+                    sendSwipe(totalDx < 0 ? "left" : "right")
+                }
+            case .vertical:
+                if abs(totalDy) >= kSwipeMinPx {
+                    sendSwipe(totalDy < 0 ? "up" : "down")
+                }
+            case .undecided:
+                break
+            }
+
             if spd > 60 {
                 let (mvx, mvy) = axisLocked(dx: velX * kScrollScale * 0.13,
                                             dy: velY * kScrollScale * 0.13)
